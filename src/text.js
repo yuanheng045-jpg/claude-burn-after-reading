@@ -15,6 +15,7 @@ const LANGS = {
     burned: 'burned after reading',
     fromUser: 'attached by the user',
     again: { Read: 'read the file again if you need it', tool: 'call the tool again if you need it', user: 'ask for it again if you need it' },
+    archived: (p) => `a copy is kept at ${p}, read it if you need it`,
     textCut: (n) => `${n.toLocaleString('en-US')} more characters burned after reading`,
     label: (nos, noun) => nos.length === 1
       ? `[burn-after-reading] This ${noun.one} is #${nos[0]}. After this turn it is removed from the conversation and only "${noun.one} #${nos[0]}" stays here, so if you will want to remember what it shows, say it in your reply.`
@@ -26,6 +27,7 @@ const LANGS = {
     burned: '已阅后即焚',
     fromUser: '用户发来的',
     again: { Read: '要再看就重新读这个文件', tool: '要再看就重新调一次工具', user: '要再看请用户再发一次' },
+    archived: (p) => `存档在 ${p}，要再看就读这个文件`,
     textCut: (n) => `后面 ${n} 个字已阅后即焚`,
     label: (nos, noun) => nos.length === 1
       ? `[burn-after-reading] 这${noun.one}是 #${nos[0]}。这一轮之后它会从对话里拿掉，这里只留"${noun.short} #${nos[0]}"；之后还想记得里面是什么，就在回复里说一句。`
@@ -38,7 +40,7 @@ const L = (lang) => LANGS[lang] ?? LANGS.en
 
 /**
  * The text that takes the place of one burned image or PDF.
- * @param {{ kind: 'image'|'pdf', label?: string|null, tool?: string|null, path?: string|null, time?: string, fromUser?: boolean }} it
+ * @param {{ kind: 'image'|'pdf', label?: string|null, tool?: string|null, path?: string|null, time?: string, fromUser?: boolean, archived?: string|null }} it
  * @param {string} lang
  */
 export function mediaPlaceholder(it, lang = 'en') {
@@ -48,17 +50,17 @@ export function mediaPlaceholder(it, lang = 'en') {
   if (it.fromUser) parts.push(t.fromUser)
   else if (it.tool) parts.push(it.path ? `${it.tool} ${it.path}` : it.tool)
   if (it.time) parts.push(it.time)
-  parts.push(it.fromUser ? t.again.user : it.tool === 'Read' ? t.again.Read : t.again.tool)
+  parts.push(it.archived ? t.archived(it.archived) : it.fromUser ? t.again.user : it.tool === 'Read' ? t.again.Read : t.again.tool)
   return lang === 'zh' ? `〔${parts.join(' · ')}〕` : `[${parts.join(' · ')}]`
 }
 
 /** The tail added after the kept start of a long text tool result. */
-export function textPlaceholder(cut, tool, time, lang = 'en') {
+export function textPlaceholder(cut, tool, time, lang = 'en', archived = null) {
   const t = L(lang)
   const parts = [t.textCut(cut)]
   if (tool) parts.push(tool)
   if (time) parts.push(time)
-  parts.push(tool === 'Read' ? t.again.Read : t.again.tool)
+  parts.push(archived ? t.archived(archived) : tool === 'Read' ? t.again.Read : t.again.tool)
   return lang === 'zh' ? `〔${parts.join(' · ')}〕` : `[${parts.join(' · ')}]`
 }
 
@@ -81,4 +83,11 @@ export function parseLabel(text) {
 export function isOurPlaceholder(text) {
   if (typeof text !== 'string') return false
   return Object.values(LANGS).some(t => text.includes(t.burned))
+}
+const KIND_RES = Object.values(LANGS).flatMap(t => ['image', 'pdf'].map(k => [k, new RegExp(`^[\\[〔]${t[k]}( #\\d+)? ${t.burned} · `)]))
+/** 'image' or 'pdf' if `text` is the placeholder of a burned image or PDF, else null. */
+export function placeholderKind(text) {
+  if (typeof text !== 'string') return null
+  for (const [k, re] of KIND_RES) if (re.test(text)) return k
+  return null
 }

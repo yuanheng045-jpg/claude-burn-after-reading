@@ -1,7 +1,9 @@
 import { test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
-import { runHook, countMedia, optionsFromEnv } from '../src/hook.js'
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { join } from 'node:path'
+import { runHook, countMedia } from '../src/hook.js'
+import { resolveOptions } from '../src/transcript.js'
 import * as h from './helpers.js'
 
 const saved = process.env.CLAUDE_CONFIG_DIR
@@ -42,10 +44,42 @@ test('other events and odd input are ignored', () => {
   assert.equal(runHook(null, {}), '')
 })
 
-test('countMedia and options', () => {
+test('countMedia, and options: defaults, then the settings file, then environment variables', () => {
   assert.equal(countMedia({ type: 'image', file: { base64: 'x' } }), 1)
   assert.equal(countMedia({ content: [{ type: 'image', source: { type: 'base64', data: 'x' } }, { type: 'document', source: {} }] }), 2)
   assert.equal(countMedia('text'), 0)
-  assert.deepEqual(optionsFromEnv({ BURN_AFTER_READING_KEEP: '2', BURN_AFTER_READING_TEXT_OVER: '20000', BURN_AFTER_READING_LANG: 'xx' }),
-    { lang: 'en', keep: 2, textOver: 20000, backup: true, labels: true })
+  const { root } = h.tempConfig([])
+  assert.deepEqual(resolveOptions(root, {}, {}), { modes: { user: 'archive', screenshot: 'burn', file: 'burn', text: 'keep' }, textOver: 20000, keep: 0, lang: 'en', backup: true, archiveDays: 30, labels: true })
+  mkdirSync(join(root, 'burn-after-reading'), { recursive: true })
+  writeFileSync(join(root, 'burn-after-reading', 'settings.json'), JSON.stringify({ user: 'burn', text: 'archive', lang: 'zh', archiveDays: 'nonsense' }))
+  const o = resolveOptions(root, {}, { BURN_AFTER_READING_KEEP: '2', BURN_AFTER_READING_SCREENSHOT: 'keep', BURN_AFTER_READING_LANG: 'xx' })
+  assert.deepEqual(o.modes, { user: 'burn', screenshot: 'keep', file: 'burn', text: 'archive' })
+  assert.equal(o.lang, 'zh')         // a bad env value is ignored
+  assert.equal(o.archiveDays, 30)    // a bad saved value falls back to the default
+  assert.equal(o.keep, 2)
+})
+
+// ---- second review (2026-11-09) ----
+test('PostToolUse: no number for a kind that is set to keep (it stays, so nothing to say)', () => {
+  const { root } = h.tempConfig([])
+  process.env.CLAUDE_CONFIG_DIR = root
+  const read = { hook_event_name: 'PostToolUse', session_id: 's', tool_name: 'Read', tool_use_id: 't1', tool_response: { type: 'image', file: { base64: h.pngBase64() } } }
+  const shot = { ...read, tool_name: 'mcp__browser__screenshot', tool_response: [{ type: 'image', data: 'AAAA', mimeType: 'image/png' }] }
+  assert.equal(runHook(read, { BURN_AFTER_READING_FILE: 'keep' }), '')
+  assert.match(runHook(shot, { BURN_AFTER_READING_FILE: 'keep' }), /This image is #1/)
+  assert.equal(runHook(shot, { BURN_AFTER_READING_SCREENSHOT: 'keep' }), '')
+  assert.match(runHook(read, { BURN_AFTER_READING_FILE: 'archive' }), /This image is #2/)
+})
+
+test("SessionEnd: the session's subagents are burned too, and the log says so", () => {
+  const { root, dir, file } = h.tempConfig([h.toolUse('t1', 'Read', { file_path: '/a.png' }), h.readImageResult('t1'), h.say('ok')])
+  process.env.CLAUDE_CONFIG_DIR = root
+  const subDir = join(dir, h.SID, 'subagents')
+  mkdirSync(subDir, { recursive: true })
+  const side = (l) => JSON.stringify({ ...JSON.parse(l), isSidechain: true })
+  const sub = join(subDir, 'agent-x1.jsonl')
+  writeFileSync(sub, [h.toolUse('s1', 'Read', { file_path: '/b.png' }), h.readImageResult('s1', h.pngBase64(50, 50)), h.say('seen')].map(side).join('\n') + '\n')
+  runHook({ hook_event_name: 'SessionEnd', session_id: h.SID, transcript_path: file, reason: 'other' }, {})
+  assert.ok(!readFileSync(sub, 'utf8').includes('iVBORw0KGgo'))
+  assert.match(readFileSync(join(root, 'burn-after-reading', 'hook.log'), 'utf8'), /2 burned, 1 of them in subagents/)
 })

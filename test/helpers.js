@@ -1,6 +1,6 @@
 // Builders for synthetic Claude Code transcripts (shaped like what Claude Code 2.1.x writes).
 import * as zlib from 'node:zlib'
-import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -47,9 +47,19 @@ export const readImageResult = (id, data = pngBase64()) => toolResult(id, [{ typ
 export const label = (toolUseID, text) => JSON.stringify(base({ type: 'attachment', attachment: { type: 'hook_additional_context', content: [text], hookName: 'PostToolUse:Read', toolUseID, hookEvent: 'PostToolUse' } }))
 export const meta = (o) => JSON.stringify({ sessionId: SID, ...o })
 
+// every temporary folder a test makes is removed when its test file is done
+const made = []
+process.on('exit', () => { for (const d of made) { try { rmSync(d, { recursive: true, force: true }) } catch {} } })
+/** A new empty folder in the temp folder, removed afterwards. */
+export function tempDir(prefix = 'bar-test-') {
+  const d = mkdtempSync(join(tmpdir(), prefix))
+  made.push(d)
+  return d
+}
+
 /** A temporary CLAUDE_CONFIG_DIR with the transcript lines written into a project folder. */
 export function tempConfig(lines, sid = SID) {
-  const root = mkdtempSync(join(tmpdir(), 'bar-test-'))
+  const root = tempDir('bar-test-')
   const dir = join(root, 'projects', '-tmp-proj')
   mkdirSync(dir, { recursive: true })
   const file = join(dir, sid + '.jsonl')

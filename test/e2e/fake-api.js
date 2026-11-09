@@ -1,7 +1,9 @@
 // A stand-in for the Anthropic Messages API, so real Claude Code can be driven end to end with no account,
 // no cost and no network. It records every request. Scripted replies, based on the last user message:
 //   carries a tool_result        -> text reply ("seen it")
+//   text contains "AGENT <task>" -> a subagent (Agent / Task tool) is sent to do <task>
 //   text contains "READ <path>"  -> a Read tool call for that path
+//   the /burn-after-reading:settings prompt with "user=burn" -> runs the save command it describes (Bash)
 //   anything else                -> "ok"
 import { createServer } from 'node:http'
 
@@ -13,7 +15,15 @@ export function startFakeApi() {
   function decide(body) {
     const c = lastUser(body.messages || [])?.content
     if (Array.isArray(c) && c.some(b => b?.type === 'tool_result')) return { blocks: [{ type: 'text', text: 'seen it' }], stop: 'end_turn' }
-    const m = /READ (\S+)/.exec(textOf(c))
+    const text = textOf(c)
+    const agentTool = (body.tools || []).map(t => t?.name).find(n => n === 'Agent' || n === 'Task')
+    const a = /AGENT (.+)/.exec(text)
+    if (a && agentTool) return { blocks: [{ type: 'tool_use', id: 'toolu_e2e' + String(++n).padStart(4, '0'), name: agentTool, input: { description: 'look at a file', prompt: a[1].trim(), subagent_type: 'general-purpose' } }], stop: 'tool_use' }
+    const save = /node "([^"]+burn-after-reading\.js)" settings user=/.exec(text)
+    if (save && text.includes('("user=burn")')) {   // the command's "$ARGUMENTS", filled in
+      return { blocks: [{ type: 'tool_use', id: 'toolu_e2e' + String(++n).padStart(4, '0'), name: 'Bash', input: { command: `node "${save[1]}" settings user=burn`, description: 'Save the settings' } }], stop: 'tool_use' }
+    }
+    const m = /READ (\S+)/.exec(text)
     if (m) return { blocks: [{ type: 'tool_use', id: 'toolu_e2e' + String(++n).padStart(4, '0'), name: 'Read', input: { file_path: m[1] } }], stop: 'tool_use' }
     return { blocks: [{ type: 'text', text: 'ok' }], stop: 'end_turn' }
   }

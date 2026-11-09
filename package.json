@@ -13,6 +13,7 @@
     "bin",
     "src",
     "hooks",
+    "commands",
     ".claude-plugin",
     "README.md",
     "README.zh-CN.md",

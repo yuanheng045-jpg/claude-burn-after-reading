@@ -2,6 +2,7 @@ import { test, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { burnLines, withoutMedia, checkLine, fingerprint } from '../src/burn.js'
 import * as h from './helpers.js'
+import { placeholderKind, mediaPlaceholder } from '../src/text.js'
 
 beforeEach(() => h.reset())
 const J = (l) => JSON.parse(l)
@@ -163,6 +164,51 @@ test('reports image data left in record types it does not edit', () => {
   assert.deepEqual(burnLines(lines).elsewhere, { 'some-future-record': 1 })
 })
 
+// ---- what to do per kind: keep / archive / burn ----
+test('each kind follows its own setting; archived ones point Claude at the copy', () => {
+  const lines = [
+    h.userBlocks([{ type: 'text', text: 'my cat' }, h.image()]),                               // user
+    h.toolUse('s', 'mcp__browser__screenshot'), h.toolResult('s', [h.image(h.pngBase64(32, 32))]),  // screenshot
+    h.toolUse('r', 'Read', { file_path: '/a.png' }), h.readImageResult('r', h.pngBase64(16, 16)),  // file
+    h.say('seen'),
+  ]
+  const asked = []
+  const archive = (item) => { asked.push(item); return `/archive/${item.category}.png` }
+  const r = burnLines(lines, { modes: { user: 'archive', screenshot: 'keep', file: 'burn' }, archive })
+  assert.deepEqual(r.burned.map(b => [b.category, b.archived]), [['user', '/archive/user.png'], ['file', null]])
+  assert.equal(r.kept, 1)
+  assert.equal(asked.length, 1)
+  assert.equal(asked[0].mediaType, 'image/png')
+  assert.ok(asked[0].data.startsWith('iVBORw0KGgo'))
+  assert.match(J(r.lines[0]).message.content[1].text, /attached by the user · .+ · a copy is kept at \/archive\/user\.png, read it if you need it\]$/)
+  assert.equal(r.lines[2], lines[2])                                                         // screenshot kept
+  assert.match(J(r.lines[4]).message.content[0].content[0].text, /read the file again if you need it\]$/)
+})
+
+test('if an archive copy cannot be saved, that item stays where it is', () => {
+  const lines = [h.userBlocks([h.image()]), h.say('ok')]
+  const r = burnLines(lines, { modes: { user: 'archive' }, archive: () => null })
+  assert.equal(r.burned.length, 0)
+  assert.deepEqual(r.lines, lines)
+  assert.match(r.skipped[0].reason, /archive copy could not be saved/)
+  assert.equal(burnLines(lines, { modes: { user: 'archive' } }).burned.length, 0)   // no archive function: same
+})
+
+test('long text can be archived too: the whole text goes to the copy, the start stays', () => {
+  const lines = [h.toolUse('b', 'Bash'), h.toolResult('b', 'z'.repeat(30000)), h.say('ok')]
+  let saved = ''
+  const r = burnLines(lines, { modes: { text: 'archive' }, archive: (it) => { saved = it.text; return '/archive/t.txt' } })
+  assert.equal(saved.length, 30000)
+  assert.match(J(r.lines[1]).message.content[0].content[1].text, /29,600 more characters burned after reading · Bash · .+ · a copy is kept at \/archive\/t\.txt/)
+})
+
+test("finds Claude Code's own saved file of each burned attached image", () => {
+  const meta = JSON.stringify({ type: 'user', isMeta: true, uuid: 'm', sessionId: h.SID, message: { role: 'user', content: [{ type: 'text', text: '[Image: source: /tmp/claude-1/p/s/images/1.png]\n[Image: source: /tmp/claude-1/p/s/images/2.png]' }] } })
+  const lines = [h.userBlocks([{ type: 'text', text: 'two' }, h.image(h.pngBase64(8, 8)), h.image(h.pngBase64(9, 9))]), h.meta({ type: 'attachment', attachment: { type: 'x' } }), meta, h.say('ok')]
+  assert.deepEqual(burnLines(lines).tempCopies, ['/tmp/claude-1/p/s/images/1.png', '/tmp/claude-1/p/s/images/2.png'])
+  assert.deepEqual(burnLines(lines, { keep: 1 }).tempCopies, ['/tmp/claude-1/p/s/images/1.png'])
+})
+
 // ---- review findings (2026-11-09) ----
 test('an API error Claude Code wrote itself is not an answer: the image stays', () => {
   const err = JSON.stringify({ type: 'assistant', isApiErrorMessage: true, uuid: 'e1', sessionId: h.SID, message: { role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text: 'API Error: 529 overloaded' }] } })
@@ -234,4 +280,55 @@ test('backups drop image data wherever it sits, including MCP-shaped copies and 
   const b = withoutMedia(lines)
   assert.ok(!b.join('\n').includes('iVBORw0KGgo'))
   assert.deepEqual(burnLines(lines).elsewhere, { attachment: 1, 'something-new': 1 })
+})
+
+// ---- second review (2026-11-09) ----
+const sourceRow = (paths) => JSON.stringify({ type: 'user', isMeta: true, uuid: 'm', sessionId: h.SID, message: { role: 'user', content: [{ type: 'text', text: paths.map(p => `[Image: source: ${p}]`).join('\n') }] } })
+
+test("Claude Code's own files: none are picked when there isn't exactly one source line per image", () => {
+  // the first image has no source line: by position, the kept second image's file would be taken for the first one's
+  const lines = [h.userBlocks([h.image(h.pngBase64(8, 8)), h.image(h.pngBase64(9, 9))]), sourceRow(['/tmp/c/p/s/images/2.png']), h.say('ok')]
+  const r = burnLines(lines, { keep: 1 })
+  assert.equal(r.burned.length, 1)
+  assert.deepEqual(r.tempCopies, [])
+})
+
+test("Claude Code's own files: a later run still finds the right file when earlier images are already burned", () => {
+  const lines = [h.userBlocks([h.image(h.pngBase64(8, 8)), h.image(h.pngBase64(9, 9))]), sourceRow(['/tmp/c/p/s/images/1.png', '/tmp/c/p/s/images/2.png']), h.say('ok')]
+  const first = burnLines(lines, { keep: 1 })
+  assert.deepEqual(first.tempCopies, ['/tmp/c/p/s/images/1.png'])
+  const second = burnLines(first.lines, { keep: 0 })
+  assert.equal(second.burned.length, 1)
+  assert.deepEqual(second.tempCopies, ['/tmp/c/p/s/images/2.png'])
+  // the same in Chinese placeholders
+  const zh = burnLines(burnLines(lines, { keep: 1, lang: 'zh' }).lines, { lang: 'zh' })
+  assert.deepEqual(zh.tempCopies, ['/tmp/c/p/s/images/2.png'])
+})
+
+test('an unknown mode touches nothing', () => {
+  const lines = [h.userBlocks([h.image()]), h.say('ok')]
+  const r = burnLines(lines, { modes: { user: 'archived' } })
+  assert.equal(r.burned.length, 0)
+  assert.deepEqual(r.lines, lines)
+  assert.equal(r.kept, 1)
+})
+
+test("in a subagent's transcript (all sidechain rows) its answers count", () => {
+  const side = (l) => JSON.stringify({ ...J(l), isSidechain: true, agentId: 'abc' })
+  const lines = [h.userText('look at it'), h.toolUse('t1', 'Read', { file_path: '/a.png' }), h.readImageResult('t1'), h.say('a cat')].map(side)
+  assert.equal(burnLines(lines).burned.length, 0)                      // as a main transcript: no main answer, left alone
+  const r = burnLines(lines, { sidechain: true })
+  assert.equal(r.burned.length, 1)
+  assert.ok(!r.lines.join('\n').includes(B64))
+})
+
+test('placeholders tell images from PDFs, with or without a number, in both languages', () => {
+  for (const lang of ['en', 'zh']) {
+    for (const label of [null, '7']) {
+      assert.equal(placeholderKind(mediaPlaceholder({ kind: 'image', label, fromUser: true, time: '2026-11-09 14:32' }, lang)), 'image')
+      assert.equal(placeholderKind(mediaPlaceholder({ kind: 'pdf', label, tool: 'Read', path: '/a.pdf' }, lang)), 'pdf')
+    }
+  }
+  assert.equal(placeholderKind('[image of my cat] burned after reading · later'), null)
+  assert.equal(placeholderKind('look at this image'), null)
 })

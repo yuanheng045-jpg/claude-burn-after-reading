@@ -11,7 +11,7 @@
 
 import { createHash } from 'node:crypto'
 import { imageSize, imageTokens } from './media.js'
-import { localTime, mediaPlaceholder, textPlaceholder, parseLabel, isOurPlaceholder } from './text.js'
+import { localTime, mediaPlaceholder, textPlaceholder, parseLabel, isOurPlaceholder, placeholderKind } from './text.js'
 
 /**
  * @typedef {object} BurnOptions
@@ -21,6 +21,12 @@ import { localTime, mediaPlaceholder, textPlaceholder, parseLabel, isOurPlacehol
  * @property {string} [lang]       placeholder language: 'en' (default) or 'zh'
  * @property {Set<number>} [frozen]   line indexes that must not be edited (for example lines that are not valid UTF-8)
  * @property {Map<string,string>} [labelsByFingerprint]  image fingerprint -> number, as recorded by the PostToolUse hook
+ * @property {{ user?: Mode, screenshot?: Mode, file?: Mode, text?: Mode }} [modes]  what to do per category (default: burn
+ *   images and PDFs of every category, leave text; `textOver` > 0 alone also turns text on)
+ * @property {(item: object) => string|null} [archive]  saves a copy for 'archive' mode and returns where; null = couldn't
+ * @property {boolean} [sidechain]  the lines are a subagent's transcript: its (sidechain) answers count as answers
+ *
+ * @typedef {'keep'|'archive'|'burn'} Mode
  *
  * @typedef {object} BurnedItem
  * @property {'image'|'pdf'|'text'} kind
@@ -37,6 +43,7 @@ export const isB64Media = (b) => (b?.type === 'image' || b?.type === 'document')
 export const fingerprint = (data) => createHash('sha1').update(data).digest('hex')
 const mediaKind = (b) => (b.type === 'document' ? 'pdf' : 'image')
 const MEDIA_MIME = /^(image\/|application\/pdf)/
+const IMAGE_SOURCE_RE = /\[Image: source: ([^\]\n]+)\]/g
 const LONE_ESCAPE = /\\u[dD][89abAB][0-9a-fA-F]{2}(?!\\u[dD][c-fC-F][0-9a-fA-F]{2})|(?<!\\u[dD][89abAB][0-9a-fA-F]{2})\\u[dD][c-fC-F][0-9a-fA-F]{2}/g
 const loneSurrogates = (line) => (line.match(LONE_ESCAPE) || []).length
 
@@ -44,8 +51,9 @@ function parse(line) {
   if (!line || line.length < 2 || line[0] !== '{') return null
   try { return JSON.parse(line) } catch { return null }
 }
-/** A real answer from Claude (not an API error Claude Code wrote itself, not a sidechain). */
-const isRealAnswer = (o) => o?.type === 'assistant' && !o.isApiErrorMessage && !o.isSidechain && o.message?.model !== '<synthetic>'
+/** A real answer from Claude (not an API error Claude Code wrote itself; a sidechain one only in a subagent's transcript). */
+const isRealAnswer = (o, sidechain) => o?.type === 'assistant' && !o.isApiErrorMessage && (sidechain || !o.isSidechain) && o.message?.model !== '<synthetic>'
+const MODES = new Set(['keep', 'archive', 'burn'])
 const hasMediaIn = (content) => Array.isArray(content) && content.some(b => isB64Media(b) || (b?.type === 'tool_result' && Array.isArray(b.content) && b.content.some(isB64Media)))
 
 /** Text of a tool_result's content (string or array of blocks), leaving out placeholders this tool put there. */
@@ -159,16 +167,21 @@ function countData(v, skip = null) {
  * Plan and apply a burn to transcript lines.
  * @param {string[]} lines lines of the .jsonl file (as split on '\n')
  * @param {BurnOptions} [opts]
- * @returns {{ lines: string[], burned: BurnedItem[], skipped: Array<{ line: number, reason: string }>, kept: number, unseen: number, elsewhere: Record<string, number> }}
+ * @returns {{ lines: string[], burned: BurnedItem[], skipped: Array<{ line: number, reason: string }>, kept: number, unseen: number, elsewhere: Record<string, number>, tempCopies: string[] }}
  *   `elsewhere`: image data still present in record types this tool doesn't edit (a hint that Claude Code changed its format)
+ *   `tempCopies`: Claude Code's own saved files of the burned attached images (the caller decides whether to delete them)
  */
 export function burnLines(lines, opts = {}) {
   const keep = Math.max(0, Math.floor(opts.keep ?? 0))
-  const textOver = Math.max(0, Math.floor(opts.textOver ?? 0))
+  // what to do with each kind of thing: 'keep' (leave it), 'archive' (burn, keep a copy Claude can read), 'burn' (destroy)
+  const modes = { user: 'burn', screenshot: 'burn', file: 'burn', text: opts.textOver > 0 ? 'burn' : 'keep', ...(opts.modes ?? {}) }
+  for (const k of Object.keys(modes)) if (!MODES.has(modes[k])) modes[k] = 'keep'   // something unknown: touch nothing
+  const textOver = modes.text !== 'keep' ? Math.max(1, Math.floor(opts.textOver || 20000)) : 0
   const keepChars = Math.min(Math.max(0, Math.floor(opts.textKeep ?? 400)), textOver || Infinity)
   const lang = opts.lang ?? 'en'
   const frozen = opts.frozen ?? new Set()
   const byFp = opts.labelsByFingerprint ?? new Map()
+  const archive = typeof opts.archive === 'function' ? opts.archive : null
 
   // 1. one cheap pass: tool names, the last real answer, hook labels, and the lines worth parsing
   const tools = new Map()   // tool_use id -> { name, path }
@@ -185,7 +198,7 @@ export function burnLines(lines, opts = {}) {
     const o = parse(l)
     if (!o) continue
     if (o.type === 'assistant') {
-      if (isRealAnswer(o)) lastAnswer = i
+      if (isRealAnswer(o, !!opts.sidechain)) lastAnswer = i
       const c = o.message?.content
       if (Array.isArray(c)) for (const b of c) {
         if (b?.type === 'tool_use' && b.id) tools.set(b.id, { name: String(b.name ?? ''), path: typeof b.input?.file_path === 'string' ? b.input.file_path : null })
@@ -196,36 +209,49 @@ export function burnLines(lines, opts = {}) {
     } else if (o.type === 'user' && maybeMedia) candidates.push(i)
   }
 
-  // 2. everything seen, in order, so the newest `keep` can be left alone
-  /** @type {Array<{ line: number, kind: 'image'|'pdf'|'text', at: number[], nth?: number, of?: number }>} */
+  // 2. everything seen, in order, so the newest `keep` can be left alone. Each thing has a category:
+  //    'user' (attached to a message), 'file' (an image/PDF read with Read), 'screenshot' (any other tool), 'text'
+  /** @type {Array<{ line: number, kind: 'image'|'pdf'|'text', category: string, at: number[], nth?: number, of?: number, ord?: number }>} */
   const found = []
-  let unseen = 0
+  let unseen = 0, keptBySettings = 0
   const parsed = new Map()
+  const imageSlots = new Map()   // line -> how many images the message has, burned ones (placeholders) included
   for (const i of candidates) {
     const o = parse(lines[i])
     const c = o?.message?.content
     if (!Array.isArray(c)) continue
     parsed.set(i, o)
     const seen = i < lastAnswer
+    let ord = 0   // which attached image of this message it is (Claude Code saves them in this order)
     c.forEach((b, j) => {
-      if (isB64Media(b)) { if (seen) found.push({ line: i, kind: mediaKind(b), at: [j] }); else unseen++ }
+      if (b?.type === 'text' && placeholderKind(b.text) === 'image') ord++   // burned by an earlier run: still a slot
+      else if (isB64Media(b)) {
+        const f = { line: i, kind: mediaKind(b), category: 'user', at: [j], ord: b.type === 'image' ? ord++ : -1 }
+        if (!seen) unseen++
+        else if (modes.user === 'keep') keptBySettings++
+        else found.push(f)
+      } else if (b?.type === 'image') ord++   // an image that isn't inline data: counted, so the count can't match by luck
       else if (b?.type === 'tool_result') {
+        const category = tools.get(b.tool_use_id)?.name === 'Read' ? 'file' : 'screenshot'
         const of = Array.isArray(b.content) ? b.content.filter(isB64Media).length : 0
         let nth = 0   // which image of this tool result it is (the hook numbers them in this order)
         if (Array.isArray(b.content)) b.content.forEach((x, k) => {
           if (!isB64Media(x)) return
-          if (seen) found.push({ line: i, kind: mediaKind(x), at: [j, k], nth, of }); else unseen++
+          if (!seen) unseen++
+          else if (modes[category] === 'keep') keptBySettings++
+          else found.push({ line: i, kind: mediaKind(x), category, at: [j, k], nth, of })
           nth++
         })
         const len = textOver > 0 && seen && !alreadyShortened(b.content) ? charLen(resultText(b.content)) : 0
-        if (len > textOver && len - keepChars >= MIN_SAVING) found.push({ line: i, kind: 'text', at: [j] })
+        if (len > textOver && len - keepChars >= MIN_SAVING) found.push({ line: i, kind: 'text', category: 'text', at: [j] })
       }
     })
+    imageSlots.set(i, ord)
   }
   // `keep` is about images/PDFs; long text results (opt-in) are all shortened once Claude has answered them
   const media = found.filter(f => f.kind !== 'text'), texts = found.filter(f => f.kind === 'text')
   const burnSet = new Set([...media.slice(0, Math.max(0, media.length - keep)), ...texts])
-  const kept = found.length - burnSet.size
+  const kept = found.length - burnSet.size + keptBySettings
 
   // 3. edit line by line; a line is written only if it passes checkLine
   const out = lines.slice()
@@ -233,6 +259,7 @@ export function burnLines(lines, opts = {}) {
   const burned = []
   const skipped = []
   const burnedText = new Map()   // fingerprint -> placeholder, for copies elsewhere in the file
+  const tempCopies = []          // Claude Code's own files of burned attached images
   const byLine = new Map()
   for (const f of found) if (burnSet.has(f)) { if (!byLine.has(f.line)) byLine.set(f.line, []); byLine.get(f.line).push(f) }
   for (const [i, fs] of byLine) {
@@ -241,7 +268,15 @@ export function burnLines(lines, opts = {}) {
     const time = localTime(o.timestamp)
     const items = []
     const fps = new Set()
+    const ords = []
     let textTail = null
+    // asks for an archive copy; if one is wanted but can't be made, the item stays where it is
+    const keepCopy = (f, payload) => {
+      if (modes[f.category] !== 'archive') return { ok: true, path: null }
+      const path = archive ? archive({ ...payload, kind: f.kind, category: f.category, line: i, timestamp: o.timestamp }) : null
+      if (!path) skipped.push({ line: i, reason: 'an archive copy could not be saved, so it was left in place' })
+      return { ok: !!path, path }
+    }
     // images first, long text after: shortening a result must not lose the placeholder of an image burned from it
     for (const f of [...fs.filter(f => f.kind !== 'text'), ...fs.filter(f => f.kind === 'text')]) {
       const c = o.message.content
@@ -249,10 +284,12 @@ export function burnLines(lines, opts = {}) {
         const b = c[f.at[0]]
         const tool = tools.get(b.tool_use_id)?.name ?? null
         const full = resultText(b.content)
-        const tail = textPlaceholder(charLen(full) - keepChars, tool, time, lang)
+        const copy = keepCopy(f, { text: full, label: null })
+        if (!copy.ok) continue
+        const tail = textPlaceholder(charLen(full) - keepChars, tool, time, lang, copy.path)
         textTail = tail
         c[f.at[0]] = { ...b, content: shortenResult(b.content, keepChars, tail) }
-        items.push({ kind: 'text', line: i, tool, path: tools.get(b.tool_use_id)?.path ?? null, label: null, bytes: full.length, tokens: null })
+        items.push({ kind: 'text', category: 'text', line: i, tool, path: tools.get(b.tool_use_id)?.path ?? null, label: null, archived: copy.path, bytes: full.length, tokens: null })
         continue
       }
       const owner = f.at.length === 2 ? c[f.at[0]] : null
@@ -262,17 +299,21 @@ export function burnLines(lines, opts = {}) {
       // the number: matched by fingerprint (recorded by the hook); by position only if the counts agree exactly
       let label = byFp.get(fp) ?? null
       if (!label && owner) { const nos = labels.get(owner.tool_use_id) ?? []; if (nos.length === f.of) label = nos[f.nth] ?? null }
+      const copy = keepCopy(f, { data: block.source.data, mediaType: block.source.media_type, label })
+      if (!copy.ok) continue
       const item = {
-        kind: f.kind, line: i, tool: owner ? (t?.name ?? 'tool') : null, path: owner ? (t?.path ?? null) : null, label,
-        bytes: block.source.data.length, tokens: f.kind === 'image' ? imageTokens(imageSize(block.source.data)) : null,
+        kind: f.kind, category: f.category, line: i, tool: owner ? (t?.name ?? 'tool') : null, path: owner ? (t?.path ?? null) : null, label,
+        archived: copy.path, bytes: block.source.data.length, tokens: f.kind === 'image' ? imageTokens(imageSize(block.source.data)) : null,
       }
-      const text = mediaPlaceholder({ kind: f.kind, label, tool: item.tool, path: item.path, time, fromUser: !owner }, lang)
+      const text = mediaPlaceholder({ kind: f.kind, label, tool: item.tool, path: item.path, time, fromUser: !owner, archived: copy.path }, lang)
       if (owner) owner.content[f.at[1]] = { type: 'text', text }
       else c[f.at[0]] = { type: 'text', text }
+      if (!owner && f.ord >= 0) ords.push(f.ord)
       fps.add(fp)
       burnedText.set(fp, text)
       items.push(item)
     }
+    if (!items.length) continue
     if (o.toolUseResult !== undefined) {
       // nothing in the message holds image data any more: empty all of the copy's; otherwise only the burned ones
       if (!hasMediaIn(o.message.content)) blankData(o.toolUseResult)
@@ -284,6 +325,20 @@ export function burnLines(lines, opts = {}) {
     if (why) { skipped.push({ line: i, reason: why }); for (const fp of fps) burnedText.delete(fp); continue }
     out[i] = line
     burned.push(...items)
+    // Claude Code also saves each image attached to a message as a file and tells Claude where:
+    // "[Image: source: /tmp/claude-…/<session>/images/1.png]" in the rows right after it, one per image, in order.
+    // Collect the burned ones, but only if there is exactly one such line per image: otherwise which file is whose
+    // can't be told for sure, and a file that belongs to an image still in use must never be deleted.
+    if (ords.length) {
+      const paths = []
+      for (let k = i + 1; k < lines.length; k++) {
+        const m = parse(lines[k])
+        if (!m) continue
+        if (m.type === 'assistant' || (m.type === 'user' && m.isMeta !== true)) break
+        if (m.type === 'user') for (const t of textsOf(m.message?.content)) for (const x of t.matchAll(IMAGE_SOURCE_RE)) paths.push(x[1].trim())
+      }
+      if (paths.length === imageSlots.get(i)) for (const n of ords) tempCopies.push(paths[n])
+    }
   }
 
   // 4. lines burned by an earlier run (or by hand) may still carry the image copy in toolUseResult
@@ -340,7 +395,7 @@ export function burnLines(lines, opts = {}) {
     if (n) elsewhere[o.type ?? '?'] = (elsewhere[o.type ?? '?'] ?? 0) + n
   }
 
-  return { lines: out, burned, skipped, kept, unseen, elsewhere }
+  return { lines: out, burned, skipped, kept, unseen, elsewhere, tempCopies }
 }
 
 /**

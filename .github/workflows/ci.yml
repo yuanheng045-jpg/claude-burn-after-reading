@@ -26,15 +26,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
         claude-code: ['2.1.281', 'latest']
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - run: npm install -g @anthropic-ai/claude-code@${{ matrix.claude-code }}
-      - run: claude --version
+      - name: Point the tests at the installed Claude Code
+        shell: bash
+        run: echo "CLAUDE_BIN=$(npm root -g)/@anthropic-ai/claude-code/bin/claude.exe" >> "$GITHUB_ENV"
+      - run: '"$CLAUDE_BIN" --version'
+        shell: bash
       - run: npm run test:e2e
-        env:
-          CLAUDE_BIN: claude
