@@ -1,0 +1,20 @@
+{
+  "description": "burn-after-reading: number images when Claude sees them; burn what Claude has seen when the session ends",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Read|mcp__.*",
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/burn-after-reading.js\" hook", "timeout": 10 }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/burn-after-reading.js\" hook", "timeout": 30 }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "burn-after-reading",
+  "version": "0.1.0",
+  "description": "Once Claude has seen an image or PDF, take it out of the transcript when the session ends, so resumed sessions stop re-sending it. Images are numbered when Claude sees them, and only the number stays.",
+  "author": { "name": "yuanheng045-jpg" },
+  "homepage": "https://github.com/yuanheng045-jpg/claude-burn-after-reading",
+  "repository": "https://github.com/yuanheng045-jpg/claude-burn-after-reading",
+  "license": "MIT",
+  "keywords": ["images", "privacy", "tokens", "transcript"]
+}

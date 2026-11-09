@@ -1,0 +1,11 @@
+{
+  "name": "burn-after-reading",
+  "owner": { "name": "yuanheng045-jpg" },
+  "plugins": [
+    {
+      "name": "burn-after-reading",
+      "source": "./",
+      "description": "Take images and PDFs Claude has already seen out of the Claude Code transcript."
+    }
+  ]
+}

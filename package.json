@@ -1,0 +1,42 @@
+{
+  "name": "claude-burn-after-reading",
+  "version": "0.1.0",
+  "description": "Once Claude has seen an image, PDF or huge tool output, take it out of the Claude Code transcript so resumed sessions stop re-sending it.",
+  "type": "module",
+  "bin": {
+    "burn-after-reading": "bin/burn-after-reading.js"
+  },
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "hooks",
+    ".claude-plugin",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "test": "node --test test/burn.test.js test/media.test.js test/transcript.test.js test/hook.test.js test/cli.test.js",
+    "test:e2e": "node --test test/e2e/e2e.test.js"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "hooks",
+    "images",
+    "privacy",
+    "tokens",
+    "transcript"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yuanheng045-jpg/claude-burn-after-reading.git"
+  }
+}
